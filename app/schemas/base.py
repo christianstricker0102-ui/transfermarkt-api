@@ -30,9 +30,12 @@ class TransfermarktBaseModel(BaseModel):
         check_fields=False,
     )
     def parse_str_to_date(cls, v: str):
+        if not v:
+            return None
         try:
-            return parser.parse(v).date() if v else None
-        except parser.ParserError:
+            # Deutsches Datumsformat "01.01.2025" → dayfirst=True
+            return parser.parse(v, dayfirst=True).date()
+        except (parser.ParserError, ValueError, OverflowError):
             return None
 
     @field_validator(
@@ -58,6 +61,9 @@ class TransfermarktBaseModel(BaseModel):
         if not v or not any(char.isdigit() for char in v):
             return None
 
+        # Deutsche Zusatztexte entfernen ("Letzte Änderung: ...", "last change: ...")
+        v = re.split(r"(?:letzte|last)\s", v, flags=re.IGNORECASE)[0]
+
         # Clean up HTML tags if present
         if "<" in str(v):
             matches = re.findall(r"€([\d,.]+[kmb]?)", v.lower())
@@ -66,6 +72,20 @@ class TransfermarktBaseModel(BaseModel):
             value_str = matches[0]
         else:
             value_str = v.lower().replace("€", "").replace("+", "").replace("'", "").strip()
+
+        # Deutsche Formate: "Mio." → m, "Tsd." → k, "Mrd." → bn
+        value_str = re.sub(r"mio\.?", "m", value_str)
+        value_str = re.sub(r"tsd\.?", "k", value_str)
+        value_str = re.sub(r"mrd\.?", "bn", value_str)
+
+        # Deutsches Dezimalkomma: "15,00m" → "15.00m" (nur wenn Komma als Dezimal)
+        value_str = re.sub(r"(\d),(\d{1,2})([mkb]|bn|$)", r"\1.\2\3", value_str)
+
+        # Restnoise entfernen
+        value_str = re.sub(r"[^\d.kmbn]", "", value_str)
+
+        if not value_str or not any(c.isdigit() for c in value_str):
+            return None
 
         if "k" in value_str:
             return int(float(value_str.replace("k", "")) * 1_000)

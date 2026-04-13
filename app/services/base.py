@@ -1,6 +1,10 @@
 from dataclasses import dataclass, field
 from typing import Optional
 from xml.etree import ElementTree
+import json
+import os
+import time
+import logging
 
 import requests
 from bs4 import BeautifulSoup
@@ -10,6 +14,79 @@ from requests import Response, TooManyRedirects
 
 from app.utils.utils import trim
 from app.utils.xpath import Pagination
+
+logger = logging.getLogger("transfermarkt-api")
+
+# Cookie-Datei von solve_captcha.py
+COOKIE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", ".tm-cookies.json")
+
+# Persistente Session mit Cookie-Jar
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 "
+        "Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9,de;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+})
+
+_cookies_loaded = False
+_last_waf_alert = 0
+
+
+def _load_cookies():
+    """Lade gespeicherte TM-Cookies in die Session."""
+    global _cookies_loaded
+    cookie_path = os.path.normpath(COOKIE_FILE)
+    if not os.path.exists(cookie_path):
+        logger.warning(f"[TM] Keine Cookie-Datei gefunden: {cookie_path}")
+        logger.warning("[TM] Bitte 'python3 solve_captcha.py' ausfuehren!")
+        return False
+
+    try:
+        with open(cookie_path) as f:
+            cookies = json.load(f)
+        for c in cookies:
+            _session.cookies.set(
+                c["name"], c["value"],
+                domain=".transfermarkt.com",
+                path=c.get("path", "/"),
+            )
+        _cookies_loaded = True
+        logger.info(f"[TM] {len(cookies)} Cookies geladen (de+com)")
+        return True
+    except Exception as e:
+        logger.error(f"[TM] Cookie-Laden fehlgeschlagen: {e}")
+        return False
+
+
+def _check_waf_block(response: Response) -> bool:
+    """Pruefe ob Response eine WAF-Challenge ist."""
+    if response.status_code == 405 and "Human Verification" in response.text:
+        return True
+    if response.status_code == 403:
+        return True
+    return False
+
+
+def _handle_waf_block():
+    """Logge WAF-Block und alerte (max 1x pro 5 Min)."""
+    global _last_waf_alert
+    now = time.time()
+    if now - _last_waf_alert > 300:
+        _last_waf_alert = now
+        logger.error("[TM] ⚠️ WAF-Block! Cookies abgelaufen.")
+        logger.error("[TM] → Bitte 'python3 solve_captcha.py' ausfuehren!")
+
+
+# Cookies beim Import laden
+_load_cookies()
 
 
 @dataclass
@@ -44,24 +121,28 @@ class TransfermarktBase:
                 server error status code.
         """
         url = self.URL if not url else url
+
+        # Cookies nachladen falls noch nicht geschehen
+        if not _cookies_loaded:
+            _load_cookies()
+
         try:
-            response: Response = requests.get(
-                url=url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/113.0.0.0 "
-                        "Safari/537.36"
-                    ),
-                },
-            )
+            response: Response = _session.get(url=url)
         except TooManyRedirects:
             raise HTTPException(status_code=404, detail=f"Not found for url: {url}")
         except ConnectionError:
             raise HTTPException(status_code=500, detail=f"Connection error for url: {url}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error for url: {url}. {e}")
+
+        # WAF-Block erkennen und sauber melden
+        if _check_waf_block(response):
+            _handle_waf_block()
+            raise HTTPException(
+                status_code=503,
+                detail="Transfermarkt WAF-Block. Bitte 'python3 solve_captcha.py' ausfuehren.",
+            )
+
         if 400 <= response.status_code < 500:
             raise HTTPException(
                 status_code=response.status_code,
