@@ -52,14 +52,25 @@ def _load_cookies():
     try:
         with open(cookie_path) as f:
             cookies = json.load(f)
+        # Nur TM-Cookies laden. solve_captcha.py sammelt unter Umstaenden auch
+        # Ad-Tracker-Cookies (pubmatic, criteo, id5-sync, ...) — wenn die alle
+        # als .transfermarkt.com reingeschrieben werden, antwortet TM mit
+        # HTTP 400 (Cookie-Header-Overflow).
+        loaded = 0
+        skipped = 0
         for c in cookies:
+            domain = (c.get("domain") or "").lower()
+            if "transfermarkt" not in domain:
+                skipped += 1
+                continue
             _session.cookies.set(
                 c["name"], c["value"],
-                domain=".transfermarkt.com",
+                domain=domain if domain.startswith(".") else "." + domain.lstrip("www."),
                 path=c.get("path", "/"),
             )
+            loaded += 1
         _cookies_loaded = True
-        logger.info(f"[TM] {len(cookies)} Cookies geladen (de+com)")
+        logger.info(f"[TM] {loaded} TM-Cookies geladen ({skipped} Nicht-TM-Cookies verworfen)")
         return True
     except Exception as e:
         logger.error(f"[TM] Cookie-Laden fehlgeschlagen: {e}")
