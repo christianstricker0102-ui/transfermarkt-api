@@ -72,6 +72,12 @@ def _check_waf_block(response: Response) -> bool:
         return True
     if response.status_code == 403:
         return True
+    # 202 Interstitial — TM liefert Challenge-HTML ohne canonical-Link.
+    # Tritt bei Stats-/Leistungsdatendetails-URLs auf, wenn Cookies nur das
+    # Profile-Challenge bestanden haben. Ohne diesen Check parst der Scraper
+    # das Challenge-HTML und wirft generisches 404 statt sauber zu alerten.
+    if response.status_code == 202 and 'rel="canonical"' not in response.text:
+        return True
     return False
 
 
