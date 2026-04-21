@@ -87,6 +87,12 @@ class TransfermarktBaseModel(BaseModel):
         if not value_str or not any(c.isdigit() for c in value_str):
             return None
 
+        # Deutscher Tausender-Separator: "2.970" → "2970", "1.234.567" → "1234567".
+        # Nur wenn kein Suffix (k/m/bn) und Muster strikt Tausender-Gruppierung ist.
+        # Ohne diesen Schritt macht int(float("2.970")) = 2 (Bug bei minutesPlayed/appearances).
+        if not any(s in value_str for s in ("k", "m", "bn", "b")) and re.match(r"^\d{1,3}(?:\.\d{3})+$", value_str):
+            value_str = value_str.replace(".", "")
+
         if "k" in value_str:
             return int(float(value_str.replace("k", "")) * 1_000)
         elif "m" in value_str:
