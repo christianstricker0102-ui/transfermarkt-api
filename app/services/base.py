@@ -6,11 +6,17 @@ import os
 import time
 import logging
 
-import requests
+from curl_cffi import requests as cffi_requests
+from curl_cffi.requests import Response
+from curl_cffi.requests.exceptions import (
+    ConnectionError as TMConnectionError,
+    RequestException,
+    Timeout,
+    TooManyRedirects,
+)
 from bs4 import BeautifulSoup
 from fastapi import HTTPException
 from lxml import etree
-from requests import Response, TooManyRedirects
 
 from app.utils.utils import trim
 from app.utils.xpath import Pagination
@@ -20,21 +26,30 @@ logger = logging.getLogger("transfermarkt-api")
 # Cookie-Datei von solve_captcha.py
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", ".tm-cookies.json")
 
-# Persistente Session mit Cookie-Jar
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/137.0.0.0 "
-        "Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9,de;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-})
+# curl_cffi-Session mit Browser-TLS-Impersonation. impersonate setzt JA3/TLS-Fingerprint
+# + konsistenten Header-Satz. Das eliminiert die wiederkehrenden WAF-Blocks: der
+# python-requests-Fingerprint war als Bot erkennbar, weshalb TM trotz gueltiger Cookies
+# staendig neu challengte (405/202/403) und Verbindungen droppte ('Connection aborted').
+#
+# SELF-HEAL durch Identitaets-Rotation (kostenlos, ohne Mensch/CAPTCHA/Cookie-Refresh):
+# bei WAF-Block oder Verbindungsabbruch wechselt make_request() auf das naechste Profil
+# (frische TLS-Session, anderer Browser-Fingerprint) und versucht erneut. Verifiziert
+# 2026-06-04: alle Profile erreichen TM COOKIELOS (Profil/Stats/Liga je HTTP 200) — die
+# manuelle Cookie-Loesung ist damit nur noch Last-Resort, kein Pflicht-Pfad mehr.
+IMPERSONATE_TARGETS = ["chrome", "chrome131", "safari", "edge"]
+_target_idx = 0
+
+
+def _build_session(target):
+    """Frische curl_cffi-Session mit der angegebenen Browser-Impersonation."""
+    s = cffi_requests.Session(impersonate=target)
+    # Accept-Language ergaenzen (englische Vereins-/Wettbewerbsnamen). TLS-Fingerprint
+    # und Header-Reihenfolge bleiben unter Kontrolle von impersonate.
+    s.headers.update({"Accept-Language": "en-GB,en;q=0.9,de;q=0.5"})
+    return s
+
+
+_session = _build_session(IMPERSONATE_TARGETS[_target_idx])
 
 _cookies_loaded = False
 _last_waf_alert = 0
@@ -98,11 +113,23 @@ def _handle_waf_block():
     now = time.time()
     if now - _last_waf_alert > 300:
         _last_waf_alert = now
-        logger.error("[TM] ⚠️ WAF-Block! Cookies abgelaufen.")
-        logger.error("[TM] → Bitte 'python3 solve_captcha.py' ausfuehren!")
+        logger.error("[TM] ⚠️ WAF-Block — alle Impersonation-Profile erschoepft (echter IP-Bann?).")
+        logger.error("[TM] → Letzter Ausweg: 'python3 solve_captcha.py' + Backend neu starten.")
 
 
-# Cookies beim Import laden
+def _rotate_session():
+    """Self-Heal: wechselt auf die naechste Impersonation-Identitaet (frische TLS-Session).
+    Ein neuer Handshake mit anderem Browser-Profil umgeht Fingerprint-basierte WAF-
+    Re-Challenges und Verbindungsabbrueche ohne Mensch, CAPTCHA oder Cookie-Refresh."""
+    global _session, _target_idx, _cookies_loaded
+    _target_idx = (_target_idx + 1) % len(IMPERSONATE_TARGETS)
+    _session = _build_session(IMPERSONATE_TARGETS[_target_idx])
+    _cookies_loaded = False
+    _load_cookies()  # best-effort, optionaler Boost
+    logger.warning(f"[TM] Self-Heal: Session rotiert auf impersonate={IMPERSONATE_TARGETS[_target_idx]}")
+
+
+# Cookies beim Import laden (best-effort — System funktioniert auch cookielos)
 _load_cookies()
 
 
@@ -139,38 +166,55 @@ class TransfermarktBase:
         """
         url = self.URL if not url else url
 
-        # Cookies nachladen falls noch nicht geschehen
+        # Cookies nachladen falls noch nicht geschehen (best-effort, optional)
         if not _cookies_loaded:
             _load_cookies()
 
-        try:
-            response: Response = _session.get(url=url)
-        except TooManyRedirects:
-            raise HTTPException(status_code=404, detail=f"Not found for url: {url}")
-        except ConnectionError:
-            raise HTTPException(status_code=500, detail=f"Connection error for url: {url}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error for url: {url}. {e}")
+        # Self-Heal-Loop: bei WAF-Block/Verbindungsabbruch auf naechste Impersonation-
+        # Identitaet rotieren und erneut versuchen. Jede Rotation = frische TLS-Session.
+        n = len(IMPERSONATE_TARGETS)
+        for attempt in range(n):
+            is_last = attempt == n - 1
+            try:
+                response: Response = _session.get(url=url)
+            except TooManyRedirects:
+                raise HTTPException(status_code=404, detail=f"Not found for url: {url}")
+            except Timeout:
+                if not is_last:
+                    _rotate_session()
+                    continue
+                raise HTTPException(status_code=504, detail=f"Timeout for url: {url}")
+            except (TMConnectionError, RequestException) as e:
+                # Verbindungsabbruch/RST = haeufiges Block-Symptom → Identitaet wechseln.
+                if not is_last:
+                    _rotate_session()
+                    continue
+                raise HTTPException(status_code=503, detail=f"Connection/request error for url: {url}. {e}")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error for url: {url}. {e}")
 
-        # WAF-Block erkennen und sauber melden
-        if _check_waf_block(response):
-            _handle_waf_block()
-            raise HTTPException(
-                status_code=503,
-                detail="Transfermarkt WAF-Block. Bitte 'python3 solve_captcha.py' ausfuehren.",
-            )
+            # WAF-Challenge → rotieren und retry; erst nach Erschoepfung aller Profile alerten.
+            if _check_waf_block(response):
+                if not is_last:
+                    _rotate_session()
+                    continue
+                _handle_waf_block()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Transfermarkt WAF-Block (alle Impersonation-Profile erschoepft).",
+                )
 
-        if 400 <= response.status_code < 500:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Client Error. {response.reason} for url: {url}",
-            )
-        elif 500 <= response.status_code < 600:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Server Error. {response.reason} for url: {url}",
-            )
-        return response
+            if 400 <= response.status_code < 500:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Client Error. {response.reason} for url: {url}",
+                )
+            elif 500 <= response.status_code < 600:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Server Error. {response.reason} for url: {url}",
+                )
+            return response
 
     def request_url_bsoup(self) -> BeautifulSoup:
         """

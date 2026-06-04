@@ -22,7 +22,14 @@ class TransfermarktCompetitionClubs(TransfermarktBase):
 
     def __post_init__(self) -> None:
         """Initialize the TransfermarktCompetitionClubs class."""
-        self.URL = self.URL.format(competition_id=self.competition_id, season_id=self.season_id)
+        # Ohne season_id den Query-Param weglassen statt Literal "None" in die URL zu
+        # bauen. saison_id=None liefert eine degradierte 142KB-Seite; ohne Param
+        # serviert TM die volle aktuelle Saison. Verhindert auch das frueher
+        # beobachtete 'Connection aborted'-500 auf der None-URL.
+        if self.season_id:
+            self.URL = self.URL.format(competition_id=self.competition_id, season_id=self.season_id)
+        else:
+            self.URL = f"https://www.transfermarkt.com/-/startseite/wettbewerb/{self.competition_id}/plus/"
         self.page = self.request_url_page()
         self.raise_exception_if_not_found(xpath=Competitions.Profile.NAME)
 
