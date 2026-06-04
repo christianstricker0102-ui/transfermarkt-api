@@ -52,44 +52,49 @@ def _build_session(target):
 _session = _build_session(IMPERSONATE_TARGETS[_target_idx])
 
 _cookies_loaded = False
+_parsed_tm_cookies = None  # einmal geparste TM-Cookies; Session-Rotation re-nutzt sie (kein Disk-Read pro Wechsel)
 _last_waf_alert = 0
 
 
 def _load_cookies():
-    """Lade gespeicherte TM-Cookies in die Session."""
-    global _cookies_loaded
-    cookie_path = os.path.normpath(COOKIE_FILE)
-    if not os.path.exists(cookie_path):
-        logger.warning(f"[TM] Keine Cookie-Datei gefunden: {cookie_path}")
-        logger.warning("[TM] Bitte 'python3 solve_captcha.py' ausfuehren!")
-        return False
+    """Setze gespeicherte TM-Cookies in die aktuelle Session.
 
-    try:
-        with open(cookie_path) as f:
-            cookies = json.load(f)
-        # Nur TM-Cookies laden. solve_captcha.py sammelt unter Umstaenden auch
-        # Ad-Tracker-Cookies (pubmatic, criteo, id5-sync, ...) — wenn die alle
-        # als .transfermarkt.com reingeschrieben werden, antwortet TM mit
-        # HTTP 400 (Cookie-Header-Overflow).
-        loaded = 0
-        skipped = 0
-        for c in cookies:
-            domain = (c.get("domain") or "").lower()
-            if "transfermarkt" not in domain:
-                skipped += 1
-                continue
-            _session.cookies.set(
-                c["name"], c["value"],
-                domain=domain if domain.startswith(".") else "." + domain.lstrip("www."),
-                path=c.get("path", "/"),
+    Das Cookie-File wird nur EINMAL gelesen/geparst — Session-Rotationen (_rotate_session)
+    nutzen die gecachte Liste, statt bei jedem Profil-Wechsel erneut von der Platte zu lesen.
+    """
+    global _cookies_loaded, _parsed_tm_cookies
+
+    if _parsed_tm_cookies is None:
+        cookie_path = os.path.normpath(COOKIE_FILE)
+        if not os.path.exists(cookie_path):
+            logger.warning(f"[TM] Keine Cookie-Datei gefunden: {cookie_path}")
+            logger.warning("[TM] Bitte 'python3 solve_captcha.py' ausfuehren!")
+            return False
+        try:
+            with open(cookie_path) as f:
+                cookies = json.load(f)
+            # Nur TM-Cookies behalten. solve_captcha.py sammelt unter Umstaenden auch
+            # Ad-Tracker-Cookies (pubmatic, criteo, id5-sync, ...) — wenn die alle als
+            # .transfermarkt.com reingeschrieben werden, antwortet TM mit HTTP 400
+            # (Cookie-Header-Overflow).
+            _parsed_tm_cookies = [c for c in cookies if "transfermarkt" in (c.get("domain") or "").lower()]
+            logger.info(
+                f"[TM] {len(_parsed_tm_cookies)} TM-Cookies geparst "
+                f"({len(cookies) - len(_parsed_tm_cookies)} Nicht-TM-Cookies verworfen)"
             )
-            loaded += 1
-        _cookies_loaded = True
-        logger.info(f"[TM] {loaded} TM-Cookies geladen ({skipped} Nicht-TM-Cookies verworfen)")
-        return True
-    except Exception as e:
-        logger.error(f"[TM] Cookie-Laden fehlgeschlagen: {e}")
-        return False
+        except Exception as e:
+            logger.error(f"[TM] Cookie-Laden fehlgeschlagen: {e}")
+            return False
+
+    for c in _parsed_tm_cookies:
+        domain = (c.get("domain") or "").lower()
+        _session.cookies.set(
+            c["name"], c["value"],
+            domain=domain if domain.startswith(".") else "." + domain.lstrip("www."),
+            path=c.get("path", "/"),
+        )
+    _cookies_loaded = True
+    return True
 
 
 def _check_waf_block(response: Response) -> bool:
