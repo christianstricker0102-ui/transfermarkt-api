@@ -63,16 +63,15 @@ def check():
         )
         sys.exit(1)
 
-    # Warnung wenn Cookies aelter als 72h (Erfahrungswert)
-    if age and age > 72:
-        send_telegram(
-            f"⏳ <b>TM Cookies werden alt</b> ({age}h)\n"
-            "Noch OK, aber bald CAPTCHA faellig.\n"
-            "→ <code>cd ~/Dev/transfermarkt-api && python3 solve_captcha.py</code>"
-        )
-        sys.exit(0)
-
-    print(f"[OK] TM API healthy — Cookies {age}h alt")
+    # KEINE Alters-Warnung mehr. Seit dem curl_cffi-Umbau (2026-06-04, commits a32ed49 +
+    # b6032d2) sind Cookies nur noch best-effort/optionaler Boost — base.py:137
+    # "System funktioniert auch cookielos". Der WAF-Bypass laeuft ueber die
+    # TLS-Fingerprint-Impersonation (JA3), NICHT ueber Cookie-Frische.
+    # age_hours ist nur das mtime der Cookie-Datei = rein kosmetisch. Eine >72h-Warnung
+    # erzeugte daher Falschalarme ("Cookies werden alt"), obwohl /health einen ECHTEN
+    # Live-TM-Request macht und auf "ok" steht. Echter Alarm bleibt: status==captcha_required
+    # (oben, exit 1) feuert nur wenn ein realer Request tatsaechlich WAF-geblockt wird.
+    print(f"[OK] TM API healthy — Live-Request ok (Cookies {age}h, cookielos-tauglich)")
 
 
 if __name__ == "__main__":
