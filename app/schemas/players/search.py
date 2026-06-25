@@ -4,8 +4,9 @@ from app.schemas.base import AuditMixin, TransfermarktBaseModel
 
 
 class PlayerSearchClub(TransfermarktBaseModel):
-    id: str
-    name: str
+    # Vereinslose Treffer in der Spielersuche haben keinen Verein → None
+    id: Optional[str]
+    name: Optional[str]
 
 
 class PlayerSearchResult(TransfermarktBaseModel):

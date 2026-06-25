@@ -108,7 +108,11 @@ class TransfermarktBaseModel(BaseModel):
     def parse_height(cls, v: str) -> Optional[int]:
         if not v or not any(char.isdigit() for char in v):
             return None
-        return int(v.replace(",", "").replace("m", "").replace("،", ""))
+        try:
+            # Unerwartete Formate (z.B. "188 cm") dürfen keinen 500 auslösen → None statt ValueError
+            return int(v.replace(",", "").replace("m", "").replace("،", ""))
+        except (ValueError, TypeError):
+            return None
 
     @field_validator("days", mode="before", check_fields=False)
     def parse_days(cls, v: str) -> Optional[int]:

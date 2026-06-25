@@ -19,7 +19,8 @@ class PlayerPosition(TransfermarktBaseModel):
 
 class PlayerClub(TransfermarktBaseModel):
     id: Optional[str]
-    name: str
+    # Vereinslose / karrierebeendete Spieler haben keinen aktuellen Vereinsnamen → None
+    name: Optional[str]
     joined: Optional[date]
     contract_expires: Optional[date]
     contract_option: Optional[str]

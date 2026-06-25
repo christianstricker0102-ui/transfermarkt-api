@@ -13,7 +13,7 @@ class PlayerTransfer(TransfermarktBaseModel):
     id: str
     club_from: PlayerTransferClub
     club_to: PlayerTransferClub
-    date: date
+    date: Optional[date]
     upcoming: bool
     season: str
     market_value: Optional[int]
