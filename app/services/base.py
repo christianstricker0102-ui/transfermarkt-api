@@ -39,6 +39,20 @@ COOKIE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", ".tm-cookies.j
 IMPERSONATE_TARGETS = ["chrome", "chrome131", "safari", "edge"]
 _target_idx = 0
 
+# WARTUNGS-FALLBACK (2026-08-08): transfermarkt.com liefert zeitweise eine Akamai-
+# Wartungsseite (HTTP 503, Titel "Transfermarkt Maintenance"), waehrend Schwester-
+# Domains normal antworten. www.transfermarkt.us ist englischsprachig wie .com,
+# daher bleiben alle XPath-/Label-Parser gueltig (.de haette deutsche Labels und
+# wuerde still falsch parsen). Der Host bleibt sticky auf dem Fallback bis zum
+# naechsten Prozess-Start — der launchd-Restart probiert automatisch wieder .com.
+MAINTENANCE_FALLBACK_HOST = "www.transfermarkt.us"
+_tm_host = "www.transfermarkt.com"
+
+
+def _is_maintenance(response: Response) -> bool:
+    """Erkennt die host-weite TM-Wartungsseite (kein Fingerprint-/WAF-Thema)."""
+    return response.status_code == 503 and "Transfermarkt Maintenance" in response.text
+
 
 def _build_session(target):
     """Frische curl_cffi-Session mit der angegebenen Browser-Impersonation."""
@@ -54,6 +68,12 @@ _session = _build_session(IMPERSONATE_TARGETS[_target_idx])
 _cookies_loaded = False
 _parsed_tm_cookies = None  # einmal geparste TM-Cookies; Session-Rotation re-nutzt sie (kein Disk-Read pro Wechsel)
 _last_waf_alert = 0
+_last_rotation = 0.0
+# Rotations-Cooldown gegen Kaskaden: die sync-Handler laufen im uvicorn-Threadpool —
+# ein WAF-/Verbindungs-Ereignis laesst sonst JEDEN fehlgeschlagenen Thread pro Versuch
+# rotieren (83k Rotations-Logzeilen bis 08/2026), jede frische TLS-Session startet kalt
+# und wird nie warm. Im Cooldown-Fenster retrien Threads auf der aktuellen Session.
+ROTATION_COOLDOWN_S = float(os.environ.get("TM_ROTATION_COOLDOWN_S", "10"))
 
 
 def _load_cookies():
@@ -125,8 +145,16 @@ def _handle_waf_block():
 def _rotate_session():
     """Self-Heal: wechselt auf die naechste Impersonation-Identitaet (frische TLS-Session).
     Ein neuer Handshake mit anderem Browser-Profil umgeht Fingerprint-basierte WAF-
-    Re-Challenges und Verbindungsabbrueche ohne Mensch, CAPTCHA oder Cookie-Refresh."""
-    global _session, _target_idx, _cookies_loaded
+    Re-Challenges und Verbindungsabbrueche ohne Mensch, CAPTCHA oder Cookie-Refresh.
+    Drosselt sich selbst (ROTATION_COOLDOWN_S): im Cooldown ist der Aufruf ein No-op
+    mit kurzem Backoff — der Caller retried dann auf der gerade frisch rotierten
+    Session, statt sie sofort wieder wegzuwerfen (Kaskaden-Bremse)."""
+    global _session, _target_idx, _cookies_loaded, _last_rotation
+    now = time.time()
+    if now - _last_rotation < ROTATION_COOLDOWN_S:
+        time.sleep(0.5)  # Retry-Daempfung: sofortiges Wieder-Hämmern vermeiden
+        return
+    _last_rotation = now
     _target_idx = (_target_idx + 1) % len(IMPERSONATE_TARGETS)
     _session = _build_session(IMPERSONATE_TARGETS[_target_idx])
     _cookies_loaded = False
@@ -169,6 +197,7 @@ class TransfermarktBase:
             HTTPException: If there are too many redirects, or if the server returns a client or
                 server error status code.
         """
+        global _tm_host
         url = self.URL if not url else url
 
         # Cookies nachladen falls noch nicht geschehen (best-effort, optional)
@@ -181,7 +210,7 @@ class TransfermarktBase:
         for attempt in range(n):
             is_last = attempt == n - 1
             try:
-                response: Response = _session.get(url=url)
+                response: Response = _session.get(url=url.replace("www.transfermarkt.com", _tm_host))
             except TooManyRedirects:
                 raise HTTPException(status_code=404, detail=f"Not found for url: {url}")
             except Timeout:
@@ -197,6 +226,28 @@ class TransfermarktBase:
                 raise HTTPException(status_code=503, detail=f"Connection/request error for url: {url}. {e}")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error for url: {url}. {e}")
+
+            # Wartungsseite ist host-weit (kein Fingerprint-Thema) → einmalig auf die
+            # englischsprachige Schwester-Domain wechseln statt Profile zu rotieren.
+            if _is_maintenance(response):
+                if _tm_host == MAINTENANCE_FALLBACK_HOST:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Transfermarkt Maintenance (auch {MAINTENANCE_FALLBACK_HOST}) for url: {url}",
+                    )
+                _tm_host = MAINTENANCE_FALLBACK_HOST
+                logger.warning(
+                    f"[TM] transfermarkt.com in Wartung → Fallback auf {MAINTENANCE_FALLBACK_HOST} (sticky bis Restart)"
+                )
+                try:
+                    response = _session.get(url=url.replace("www.transfermarkt.com", _tm_host))
+                except Exception as e:
+                    raise HTTPException(status_code=503, detail=f"Fallback-Host-Fehler for url: {url}. {e}")
+                if _is_maintenance(response):
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Transfermarkt Maintenance (com+us) for url: {url}",
+                    )
 
             # WAF-Challenge → rotieren und retry; erst nach Erschoepfung aller Profile alerten.
             if _check_waf_block(response):
